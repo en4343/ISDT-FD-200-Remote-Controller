@@ -15,6 +15,7 @@ Some phone and app combinations can no longer connect to the FD-200. For example
 - **Named presets.** Save each pack or drone with its own cell count, current and cutoff, then pick it from a list. The Start button always shows exactly what it's about to do, for example "Start: Five33 6S – 6S at 10 A". If you edit a field after picking a preset, the page warns you that you're no longer using it.
 - **Scan for and pick your FD-200 from the web page.** No Bluetooth address is hardcoded. Your choice is saved and it reconnects automatically after a power cycle.
 - **Home WiFi support with automatic hotspot fallback.** Join your home network from the web page. If home WiFi can't be found, the ESP32 starts its own hotspot so you can always reach it.
+- **Auto-discharge on/off.** Turn the FD-200's own auto-discharge setting on or off from the web page, with a warning before turning it on.
 - **Live readout** of the run state, pack voltage, cell voltages, the device's active settings and the run time. See [Known limitations](#known-limitations).
 - Everything is stored on the ESP32 (saved discharger, WiFi, presets), so it works the same from any phone or computer.
 
@@ -161,6 +162,8 @@ The FD-200 protocol was worked out from a Bluetooth capture of the official app 
   | `0xE8 → 0xE9` | Miscellaneous status |
   | `0xEA → 0xEB` | Start (sub-command `02`) / stop (sub-command `03`) |
   | `0x48 → 0x49` | Sent by the app right after start. Purpose unknown; mirrored here. |
+  | `0xD2 → 0xD3` | Set auto-discharge: data `01` (on) or `00` (off) followed by 9 × `00`. Reply status `00` = OK. |
+  | `0xD4 → 0xD5` | Read auto-discharge: reply data `FF` = on, `00` = off. |
 
 - **Start payload (`0xEA`):**
   ```
@@ -168,6 +171,8 @@ The FD-200 protocol was worked out from a Bluetooth capture of the official app 
   ```
   For example, 10 A = `10 27` (0x2710 = 10000 mA), and 3.70 V cutoff = `74 0E` (0x0E74 = 3700 mV).
 - **Stop payload (`0xEA`):** `00 03 00 01 00 00 00 00 00 00 00`
+- **Long replies** (`0xE5`, `0xE7`) can arrive split across several BLE notifications. The total frame size is `plen + 5`, and the sketch reassembles the pieces and checks the checksum before using a reply.
+- **Auto-discharge:** in a capture, the FD-200 began discharging by itself about 5 s after auto-discharge was turned on with a battery connected. Turning it off did not stop the discharge already running.
 
 ### HTTP API
 
@@ -178,6 +183,7 @@ You can control it from scripts, Home Assistant, etc. The two `GET` request type
 | GET | `/status` | JSON: connection state, live readings, WiFi status |
 | GET | `/start?cells=6&volt=3.70&amps=10000` | Start a discharge. `amps` is in mA: 5000 / 10000 / 15000 / 20000 / 25000. |
 | GET | `/stop` | Stop the discharge |
+| GET | `/auto?on=1` | Turn the FD-200's auto-discharge on (`1`) or off (`0`) |
 | GET | `/scan` | Scan for BLE devices (about 5 s) |
 | GET | `/select?addr=..&type=..&name=..` | Choose and save a discharger |
 | GET | `/forget` | Forget the saved discharger |
@@ -208,8 +214,9 @@ If you try this on another FD-200, please open an issue saying whether the stock
 ## Known limitations
 
 - **Current encoding:** the current value in the start command is decoded from a 10 A capture. The 5 / 15 / 20 / 25 A settings follow the same pattern but should be checked. After starting, the *Device setting* line in the Live section shows what the FD-200 reports.
-- **Live readout:** the field positions for the live readings are partly decoded. Some values may show as zero or "unknown" depending on device state and firmware.
+- **Live readout:** the field positions for the live readings are partly decoded. Some fields may not mean what the labels suggest on every firmware.
 - **Firmware:** this has only been tried on one FD-200 and its firmware version. Other firmware may behave differently.
+- **Auto-discharge:** when it is on, the FD-200 can start a discharge on its own using whatever is set on the device. Leave it off unless you want that.
 - **One connection:** the FD-200 accepts one Bluetooth connection at a time. While the ESP32 is connected, the phone app can't connect, and the other way round.
 
 ## Safety and disclaimer
