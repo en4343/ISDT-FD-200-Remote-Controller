@@ -14,6 +14,8 @@
 //   0xE8 -> 0xE9  misc status
 //   0xEA -> 0xEB  start (sub-command 02) / stop (sub-command 03)
 //   0x48 -> 0x49  sent by app right after start (purpose unknown)
+//   0xD2 -> 0xD3  set auto-discharge: data [01 on / 00 off][9 x 00], reply status 00 = OK
+//   0xD4 -> 0xD5  read auto-discharge: reply data FF = on, 00 = off
 
 #include <WiFi.h>
 #include <ESPmDNS.h>
@@ -54,7 +56,7 @@ Preferences prefs;
 
 // Declared here, above every function, because the Arduino IDE inserts
 // auto-generated prototypes before the first function in the file.
-enum Job { JOB_NONE, JOB_START, JOB_STOP, JOB_SCAN };
+enum Job { JOB_NONE, JOB_START, JOB_STOP, JOB_SCAN, JOB_AUTO };
 enum WState { W_OFF, W_CONNECTING, W_CONNECTED, W_LOST, W_WAIT };
 
 // ---------- Home WiFi (only touched from loop(), no locking needed) ----------
@@ -103,6 +105,11 @@ volatile uint32_t elapsedMs = 0;
 volatile uint8_t  setCells = 0;
 volatile uint16_t setCutoffMv = 0;
 volatile uint16_t setCurrentMa = 0;
+volatile int8_t   autoMode = -1;      // device's auto-discharge setting: -1 unknown, 0 off, 1 on
+
+// Reassembly buffer: long replies (E5, E7) can arrive split across several notifications
+uint8_t rxBuf[96];
+size_t  rxLen = 0, rxNeed = 0;
 
 // ---------- Jobs handed from web handlers to the BLE task ----------
 portMUX_TYPE jobMux = portMUX_INITIALIZER_UNLOCKED;
@@ -114,6 +121,7 @@ String jobMsg = "";
 uint8_t  jobCells = 6;
 uint16_t jobCutoffMv = 3700;
 uint16_t jobCurrentMa = 10000;
+bool     jobAutoOn = false;
 
 // ---------- Scan results ----------
 struct FoundDev { String addr; String name; int rssi; uint8_t type; bool match; };
@@ -170,9 +178,11 @@ bool sendAndWait(const uint8_t* f, size_t n, uint8_t expect, uint32_t timeoutMs,
 // ==================================================================
 // Notifications
 // ==================================================================
-static void notifyCallback(BLERemoteCharacteristic*, uint8_t* d, size_t n, bool) {
-  printHex("<< ", d, n);
-  if (n < 5 || d[1] != 0xAA || d[2] != 0x21) return;   // continuation chunk or foreign data
+void handleFrame(const uint8_t* d, size_t n) {
+  if (n < 6) return;
+  uint8_t sum = 0;
+  for (size_t i = 2; i < n - 1; i++) sum += d[i];
+  if (sum != d[n - 1]) { Serial.println("   (bad checksum, ignored)"); return; }
   uint8_t cmd = d[4];
   respStatus[cmd] = (n >= 6) ? d[5] : 0;
   seen[cmd] = true;
@@ -188,6 +198,27 @@ static void notifyCallback(BLERemoteCharacteristic*, uint8_t* d, size_t n, bool)
     setCutoffMv  = d[23] | (d[24] << 8);
     setCurrentMa = d[25] | (d[26] << 8);
   }
+  if (cmd == 0xD5 && n >= 6) {
+    autoMode = d[5] ? 1 : 0;           // FF when on, 00 when off (seen in capture)
+  }
+}
+
+static void notifyCallback(BLERemoteCharacteristic*, uint8_t* d, size_t n, bool) {
+  printHex("<< ", d, n);
+  if (n >= 4 && d[1] == 0xAA && d[2] == 0x21) {
+    // Start of a new frame. Total size = [len][AA][dir][plen] + plen bytes (cmd + data) + chk
+    rxNeed = d[3] + 5;
+    rxLen = 0;
+    if (rxNeed > sizeof(rxBuf)) { rxNeed = 0; return; }
+  } else if (rxNeed == 0) {
+    return;                            // stray continuation or foreign data
+  }
+  size_t take = std::min(n, rxNeed - rxLen);
+  memcpy(rxBuf + rxLen, d, take);
+  rxLen += take;
+  if (rxLen < rxNeed) return;          // wait for the rest
+  rxNeed = 0;
+  handleFrame(rxBuf, rxLen);
 }
 
 class FDClientCB : public BLEClientCallbacks {
@@ -195,6 +226,8 @@ class FDClientCB : public BLEClientCallbacks {
   void onDisconnect(BLEClient*) override {
     bleConnected = false;
     runState = 0xFF;
+    autoMode = -1;
+    rxNeed = 0;
     Serial.println("BLE disconnected");
   }
 };
@@ -266,6 +299,9 @@ bool connectFD200(const String& addr, uint8_t type) {
   size_t n = buildFrame(0xE0, nullptr, 0, f);
   sendAndWait(f, n, 0xE1, 1500, 3);
 
+  n = buildFrame(0xD4, nullptr, 0, f);   // read the auto-discharge setting
+  sendAndWait(f, n, 0xD5, 1500, 2);
+
   Serial.println(">>> Connected and authenticated <<<");
   return true;
 }
@@ -305,6 +341,23 @@ bool stopDischarge(String& msg) {
   return respStatus[0xEB] == 0x00;
 }
 
+// Auto-discharge: D2 [on/off][9 x 00] -> D3 status. Read back with D4 -> D5 (FF on / 00 off).
+bool setAutoMode(bool on, String& msg) {
+  if (!bleConnected) { msg = "Not connected to the FD-200"; return false; }
+  uint8_t d[10] = {0};
+  d[0] = on ? 0x01 : 0x00;
+  uint8_t f[20];
+  size_t n = buildFrame(0xD2, d, sizeof(d), f);
+  if (!sendAndWait(f, n, 0xD3, 1500, 2)) { msg = "No acknowledgement from the FD-200"; return false; }
+  if (respStatus[0xD3] != 0x00) { msg = "FD-200 refused (status 0x" + String(respStatus[0xD3], HEX) + ")"; return false; }
+
+  n = buildFrame(0xD4, nullptr, 0, f);
+  sendAndWait(f, n, 0xD5, 1500, 2);
+  if (autoMode != (on ? 1 : 0)) { msg = "Sent, but the FD-200 still reports auto-discharge " + String(autoMode == 1 ? "on" : "off"); return false; }
+  msg = on ? "Auto-discharge ON" : "Auto-discharge OFF";
+  return true;
+}
+
 void doScan() {
   found.clear();
   BLEScan* s = BLEDevice::getScan();
@@ -325,6 +378,7 @@ void runJobNow(Job j) {
     case JOB_SCAN:  doScan(); jobOk = true; jobMsg = ""; break;
     case JOB_START: jobOk = startDischarge(jobCells, jobCutoffMv, jobCurrentMa, jobMsg); break;
     case JOB_STOP:  jobOk = stopDischarge(jobMsg); break;
+    case JOB_AUTO:  jobOk = setAutoMode(jobAutoOn, jobMsg); break;
     default: break;
   }
 }
@@ -586,6 +640,8 @@ button:disabled{opacity:.35;cursor:default}
 <button class="go" id="goBtn" onclick="start()" disabled>Start Discharge</button>
 <button class="stop" id="stopBtn" onclick="act('/stop')" disabled>Stop Discharge</button>
 <div class="box" id="msg">Ready</div>
+<label class="chk" style="margin-top:16px"><input type="checkbox" id="autoChk" onchange="setAuto()" disabled>Auto-discharge on the FD-200</label>
+<div style="font-size:12px;color:#718096;margin-top:4px" id="autoNote">When on, the FD-200 starts discharging by itself a few seconds after a battery is connected or its settings change.</div>
 
 <h3>Live</h3>
 <div class="box" id="live">Not connected</div>
@@ -682,6 +738,18 @@ function pick(x){
   .then(r=>r.json()).then(d=>{say(d.msg);$('list').innerHTML='';});
 }
 function forget(){fetch('/forget').then(r=>r.json()).then(d=>say(d.msg));}
+let lastStatus=null,autoBusy=false;
+function setAuto(){
+  const c=$('autoChk'),on=c.checked,s=lastStatus;
+  if(on){
+    const cur=s&&s.setCells?' ('+s.setCells+'S at '+(s.setCurrentMa/1000)+' A to '+(s.setCutoffMv/1000).toFixed(2)+' V/cell)':'';
+    if(!confirm('Turn on auto-discharge?\n\nIf a battery is connected, the FD-200 may START DISCHARGING within a few seconds using whatever is set on the device'+cur+'.')){c.checked=false;return;}
+  }
+  autoBusy=true;c.disabled=true;say('Sending...');
+  fetch('/auto?on='+(on?1:0)).then(r=>r.json()).then(d=>{
+    say(d.msg+(!on&&s&&s.state=='discharging'?'. Note: a discharge already running keeps going, tap Stop to end it.':''));
+  }).catch(()=>say('Network error')).finally(()=>{autoBusy=false;poll();});
+}
 function poll(){fetch('/status').then(r=>r.json()).then(s=>{
   let t;
   if(!s.addr)t='No discharger selected. Tap Scan.';
@@ -690,6 +758,8 @@ function poll(){fetch('/status').then(r=>r.json()).then(s=>{
   if(s.error){const e=document.createElement('div');e.className='err';e.textContent=s.error;$('dev').appendChild(e);}
   showWifi(s.w);
   $('goBtn').disabled=$('stopBtn').disabled=!s.connected;
+  lastStatus=s;
+  if(!autoBusy){$('autoChk').checked=s.auto==1;$('autoChk').disabled=!s.connected||s.auto<0;}
   if(!s.connected){$('live').textContent='Not connected';return;}
   $('live').textContent='State: '+s.state+
    '\nPack: '+(s.packMv/1000).toFixed(2)+' V'+
@@ -879,6 +949,13 @@ void handleStop() {
   sendResult(ok, msg);
 }
 
+void handleAuto() {
+  jobAutoOn = server.arg("on") == "1";
+  String msg;
+  bool ok = submitJob(JOB_AUTO, 5000, msg);
+  sendResult(ok, msg);
+}
+
 void handleScan() {
   String msg;
   if (!submitJob(JOB_SCAN, 45000, msg)) { sendResult(false, msg); return; }
@@ -942,7 +1019,8 @@ void handleStatus() {
              "\",\"state\":\"" + st + "\",\"packMv\":" + String(packMv) + ",\"cells\":[";
   for (int i = 0; i < 8; i++) { j += String(cellMv[i]); if (i < 7) j += ","; }
   j += "],\"setCells\":" + String(setCells) + ",\"setCutoffMv\":" + String(setCutoffMv) +
-       ",\"setCurrentMa\":" + String(setCurrentMa) + ",\"elapsedMs\":" + String(elapsedMs);
+       ",\"setCurrentMa\":" + String(setCurrentMa) + ",\"elapsedMs\":" + String(elapsedMs) +
+       ",\"auto\":" + String((int)autoMode);
 
   static const char* modeNames[] = {"off", "connecting", "connected", "lost", "waiting"};
   bool up = (wState == W_CONNECTED);
@@ -1086,6 +1164,7 @@ void setup() {
   server.on("/wififorget", HTTP_POST, handleWifiForget);
   server.on("/start", HTTP_GET, handleStart);
   server.on("/stop", HTTP_GET, handleStop);
+  server.on("/auto", HTTP_GET, handleAuto);
   server.on("/scan", HTTP_GET, handleScan);
   server.on("/select", HTTP_GET, handleSelect);
   server.on("/forget", HTTP_GET, handleForget);
