@@ -227,17 +227,25 @@ When it connects, the FD-200 expects a 22-byte "bind" frame (command `0x18`). Th
 
 If your FD-200 rejects it, you can capture your own frame:
 
-1. On an Android phone that *can* connect with the ISDT app, enable **Developer options → Enable Bluetooth HCI snoop log**.
-2. Toggle Bluetooth off and on, then connect to the FD-200 in the ISDT app.
-3. Pull a bug report (`adb bugreport`) and open the `btsnoop_hci.log` inside it with [Wireshark](https://www.wireshark.org/).
-4. Filter for writes to the device and find the 22-byte frame starting with `15 AA 12 11 18`.
-5. Replace the bytes of `AUTH_FRAME` in the sketch with yours and re-upload.
+1. **Turn on Developer options** on an Android phone that *can* connect with the ISDT app. Go to **Settings → About phone** and tap **Build number** 7 times.
+2. **Turn on Bluetooth logging:** **Settings → Developer options → Enable Bluetooth HCI snoop log**. On some phones this is a menu; pick **Enabled**.
+3. **Toggle Bluetooth off and back on**, so logging starts.
+4. **Open the ISDT app and connect to the FD-200.** Starting and stopping a discharge also captures those commands.
+5. **Create a bug report:** **Settings → Developer options → Take bug report** (choose *Interactive* or *Full*). After a minute or two a notification appears. Tap it to share the `.zip` file to yourself, for example by email or Google Drive.
+6. **Find the log in the zip:** unzip it on your computer and look for `btsnoop_hci.log`. It's usually under `FS/data/misc/bluetooth/logs/`, but the folder varies by phone, so search the zip if it isn't there.
+7. **Open `btsnoop_hci.log` in [Wireshark](https://www.wireshark.org/)** (free). Type `btatt` in the filter bar and press Enter to show only the Bluetooth data packets.
+8. **Find the auth frame:** look for an outgoing write whose value starts with `15 AA 12 11 18`. It's 22 bytes long and is one of the first writes after connecting.
+9. **Replace the bytes of `AUTH_FRAME`** in the sketch with yours and re-upload.
+
+> If you're comfortable with the command line, `adb bugreport` (from Android's [platform tools](https://developer.android.com/tools/releases/platform-tools)) does the same as step 5 over USB. You don't need it, though: the Developer options menu works fine.
+>
+> To share a capture in an issue, use Wireshark's **File → Export Packet Dissections → As JSON** with the `btatt` filter applied.
 
 If you try this on another FD-200, please open an issue saying whether the stock frame worked. That will settle it for everyone.
 
 ## Known limitations
 
-- **Current encoding:** the current value in the start command is decoded from a 10 A capture. The 5 / 15 / 20 / 25 A settings follow the same pattern but should be checked. After starting, the *Device setting* line in the Live section shows what the FD-200 reports.
+- **Current settings:** 5, 10 and 15 A have been confirmed on the device. 20 and 25 A use the same encoding but haven't been tested yet. After starting, the *Device setting* line in the Live section shows what the FD-200 reports.
 - **Unknown fields:** a few bytes in the status replies are still unidentified, and the app's "%" ring isn't reproduced.
 - **Firmware:** this has only been tried on one FD-200 and its firmware version. Other firmware may behave differently.
 - **Auto-discharge:** when it is on, the FD-200 can start a discharge on its own using whatever is set on the device. Leave it off unless you want that.
