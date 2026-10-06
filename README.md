@@ -4,6 +4,8 @@ Control an **ISDT FD-200 battery discharger** from any web browser, using an ESP
 
 Some phone and app combinations can no longer connect to the FD-200. For example, a Pixel 7 running the current ISDT GO app couldn't connect. This project skips the app entirely. The ESP32 talks to the discharger over Bluetooth Low Energy (BLE) and serves a simple web page. You can use that page from your phone, tablet or PC to start and stop discharges.
 
+> ⚠️ **Use at your own risk.** This is an unofficial hobby project built on a reverse-engineered protocol. It can start high-current discharges of lithium batteries remotely. You are responsible for your batteries, your equipment and your safety. See [Safety and disclaimer](#safety-and-disclaimer).
+
 <!-- Add a screenshot of the web UI here, for example:
 ![Web UI](docs/screenshot.png)
 -->
@@ -12,10 +14,12 @@ Some phone and app combinations can no longer connect to the FD-200. For example
 
 - **Start and stop discharging** from a web page, with no app needed.
 - **Set the cell count (1–8S), the cutoff voltage per cell, and the discharge current** (5 / 10 / 15 / 20 / 25 A).
+- **Low-cutoff protection.** Cutoffs below 3.00 V/cell are refused, and anything below 3.40 V/cell needs an explicit confirmation, both when starting and when saving a preset. The check runs on the ESP32 as well as the page, so it also applies to the HTTP API. You can change the limits with `CUTOFF_MIN_MV`, `CUTOFF_WARN_MV` and `CUTOFF_MAX_MV` at the top of the sketch.
 - **Named presets.** Save each pack or drone with its own cell count, current and cutoff, then pick it from a list. The Start button always shows exactly what it's about to do, for example "Start: Five33 6S – 6S at 10 A". If you edit a field after picking a preset, the page warns you that you're no longer using it.
 - **Scan for and pick your FD-200 from the web page.** No Bluetooth address is hardcoded. Your choice is saved and it reconnects automatically after a power cycle.
 - **Home WiFi support with automatic hotspot fallback.** Join your home network from the web page. If home WiFi can't be found, the ESP32 starts its own hotspot so you can always reach it.
-- **Live readout** of the run state, pack voltage, cell voltages, the device's active settings and the run time. See [Known limitations](#known-limitations).
+- **Auto-discharge on/off.** Turn the FD-200's own auto-discharge setting on or off from the web page, with a warning before turning it on.
+- **Live readout** of the run state, pack voltage, actual current and power, run time, discharged mAh and Wh, discharger temperature, the device's active settings, and lifetime totals (discharge count and Wh). These were checked against the official app's screen during a discharge.
 - Everything is stored on the ESP32 (saved discharger, WiFi, presets), so it works the same from any phone or computer.
 
 ## What you need
@@ -41,10 +45,10 @@ Some phone and app combinations can no longer connect to the FD-200. For example
 ### Software
 
 - [Arduino IDE](https://www.arduino.cc/en/software) (2.x recommended)
-- The **esp32 board package by Espressif Systems**, installed through the Boards Manager (see below)
+- The **esp32 board package by Espressif Systems**, installed through the Boards Manager (see [Installation](#installation-flashing-with-the-arduino-ide))
 - No extra libraries are needed. WiFi, WebServer, Preferences, ESPmDNS and BLE all come with the ESP32 board package.
 
-## Installation
+## Installation (flashing with the Arduino IDE)
 
 1. **Install the ESP32 board package**
    - In the Arduino IDE, open **File → Preferences** and add this to *Additional boards manager URLs*:
@@ -64,12 +68,17 @@ Some phone and app combinations can no longer connect to the FD-200. For example
    #define HOSTNAME "fd200"     // http://fd200.local on your home network
    ```
 
-4. **Select the board and settings**
-   - **Tools → Board → esp32 → ESP32 Dev Module** (or the entry that matches your board)
-   - **Tools → Partition Scheme → Huge APP (3MB No OTA/1MB SPIFFS)**
+4. **Select the board and settings.** Both of these are required:
 
-     WiFi and Bluetooth together make a large program. If you see **"Sketch too big"**, this setting fixes it.
-   - **Tools → Port →** the port your ESP32 is on
+   | Setting | Choose |
+   |---|---|
+   | **Tools → Board** | **esp32 → ESP32 Dev Module** |
+   | **Tools → Partition Scheme** | **Huge APP (3MB No OTA/1MB SPIFFS)** |
+   | **Tools → Port** | The port your ESP32 is on (e.g. `COM5` on Windows, `/dev/ttyUSB0` on Linux) |
+
+   - **ESP32 Dev Module** is the generic setting for classic ESP32 boards. It works even if your board's own name is listed too.
+   - **Huge APP** is needed because WiFi and Bluetooth together make the program too big for the default partition. Without it, compiling fails with **"Sketch too big"**.
+   - Leave the other Tools settings at their defaults.
 
 5. **Upload.** If the upload stalls at "Connecting…", hold the **BOOT** button on the ESP32 until it starts writing.
 
@@ -121,7 +130,7 @@ The **Use home WiFi** checkbox turns home WiFi off or on without forgetting the 
 |---|---|
 | FD-200 doesn't show up in the scan | Close the ISDT app and turn off Bluetooth on the phone that used to connect to it. Power-cycle the FD-200. Tick *Show all Bluetooth devices*. Move the ESP32 closer. |
 | "Connected, but the FD-200 did not answer the auth frame" or "rejected auth" | See [The auth frame](#the-auth-frame) below. |
-| "Sketch too big" when compiling | Set **Tools → Partition Scheme → Huge APP**. |
+| "Sketch too big" when compiling | Set **Tools → Partition Scheme → Huge APP (3MB No OTA/1MB SPIFFS)**. |
 | Upload stuck on "Connecting…" | Hold the BOOT button during upload, and try a different USB cable (some are charge-only). |
 | Can't reach `http://fd200.local` | Some devices, especially Android, don't support `.local` names. Use the IP address shown on the page or in the Serial Monitor. |
 | Lost the page after changing WiFi settings | Join the `FD200-Discharger` hotspot and open `http://192.168.4.1`. |
@@ -156,18 +165,38 @@ The FD-200 protocol was worked out from a Bluetooth capture of the official app 
   |---|---|
   | `0x18 → 0x19` | Auth / bind. Reply status `00` = OK. |
   | `0xE0 → 0xE1` | Device info (contains `FD200`) |
-  | `0xE4 → 0xE5` | Pack voltage + 8 cell voltages (mV, little-endian) |
-  | `0xE6 → 0xE7` | Run state (`00` idle, `02` discharging), elapsed time, active cells / cutoff / current |
-  | `0xE8 → 0xE9` | Miscellaneous status |
+  | `0xE4 → 0xE5` | Bytes 12–13: pack voltage (mV). Bytes 14–15: actual discharge current (mA). The 8 "cell" slots at bytes 18+ are just pack voltage ÷ cell count. The FD-200 connects through the XT60 only, with no balance lead, so it can't measure individual cells. |
+  | `0xE6 → 0xE7` | See the byte map below. |
+  | `0xE8 → 0xE9` | Byte 6: discharger temperature (°C). Other bytes unknown. |
   | `0xEA → 0xEB` | Start (sub-command `02`) / stop (sub-command `03`) |
   | `0x48 → 0x49` | Sent by the app right after start. Purpose unknown; mirrored here. |
+  | `0xD2 → 0xD3` | Set auto-discharge: data `01` (on) or `00` (off) followed by 9 × `00`. Reply status `00` = OK. |
+  | `0xD4 → 0xD5` | Read auto-discharge: reply data `FF` = on, `00` = off. |
 
+- **`0xE7` status reply byte map** (byte 0 = length byte; multi-byte values are little-endian):
+
+  | Bytes | Meaning |
+  |---|---|
+  | 6 | State: `00` idle, `02` discharging (current ramping up, about the first 20 s), `03` discharging |
+  | 8–11 | Discharged this run (mAh) |
+  | 12–15 | Discharged this run (mWh) |
+  | 16–19 | Elapsed time (ms) |
+  | 21 | Cell count setting |
+  | 23–24 | Cutoff per cell (mV) |
+  | 25–26 | Current setting (mA) |
+  | 29–30 | Lifetime number of completed discharges |
+  | 35–38 | Lifetime energy discharged (mWh) |
+
+  The FD-200 ramps current up gradually: in a 5 A capture it took about 30 s to reach full current.
 - **Start payload (`0xEA`):**
   ```
   00 02 01 01 [current mA lo] [current mA hi] 00 00 [cells] [cutoff mV lo] [cutoff mV hi]
   ```
   For example, 10 A = `10 27` (0x2710 = 10000 mA), and 3.70 V cutoff = `74 0E` (0x0E74 = 3700 mV).
 - **Stop payload (`0xEA`):** `00 03 00 01 00 00 00 00 00 00 00`
+- **MTU:** the FD-200 only sends long replies whole when the BLE MTU is raised. The sketch requests 247 after connecting. At the default MTU (23), long replies are cut off at 20 bytes.
+- **Long replies** (`0xE5`, `0xE7`) can arrive split across several BLE notifications. **Each piece starts with its own count byte** (`[count][count bytes]`). Drop each count byte and join the rest to get `AA 21 [plen] [cmd] [data...] [chk]`. The sketch reassembles the pieces and checks the checksum before using a reply.
+- **Auto-discharge:** in a capture, the FD-200 began discharging by itself about 5 s after auto-discharge was turned on with a battery connected. Turning it off did not stop the discharge already running.
 
 ### HTTP API
 
@@ -176,8 +205,9 @@ You can control it from scripts, Home Assistant, etc. The two `GET` request type
 | Method | Endpoint | Purpose |
 |---|---|---|
 | GET | `/status` | JSON: connection state, live readings, WiFi status |
-| GET | `/start?cells=6&volt=3.70&amps=10000` | Start a discharge. `amps` is in mA: 5000 / 10000 / 15000 / 20000 / 25000. |
+| GET | `/start?cells=6&volt=3.70&amps=10000` | Start a discharge. `amps` is in mA: 5000 / 10000 / 15000 / 20000 / 25000. `volt` must be 3.00–4.20, and below 3.40 also needs `&confirm=1`. |
 | GET | `/stop` | Stop the discharge |
+| GET | `/auto?on=1` | Turn the FD-200's auto-discharge on (`1`) or off (`0`) |
 | GET | `/scan` | Scan for BLE devices (about 5 s) |
 | GET | `/select?addr=..&type=..&name=..` | Choose and save a discharger |
 | GET | `/forget` | Forget the saved discharger |
@@ -208,15 +238,22 @@ If you try this on another FD-200, please open an issue saying whether the stock
 ## Known limitations
 
 - **Current encoding:** the current value in the start command is decoded from a 10 A capture. The 5 / 15 / 20 / 25 A settings follow the same pattern but should be checked. After starting, the *Device setting* line in the Live section shows what the FD-200 reports.
-- **Live readout:** the field positions for the live readings are partly decoded. Some values may show as zero or "unknown" depending on device state and firmware.
+- **Unknown fields:** a few bytes in the status replies are still unidentified, and the app's "%" ring isn't reproduced.
 - **Firmware:** this has only been tried on one FD-200 and its firmware version. Other firmware may behave differently.
+- **Auto-discharge:** when it is on, the FD-200 can start a discharge on its own using whatever is set on the device. Leave it off unless you want that.
 - **One connection:** the FD-200 accepts one Bluetooth connection at a time. While the ESP32 is connected, the phone app can't connect, and the other way round.
 
 ## Safety and disclaimer
 
 **Discharging lithium batteries at high current produces a lot of heat and carries a real fire risk.** Never leave a discharge unattended. Use a fire-safe surface or bag, and set the cell count and cutoff correctly for your pack. Double-check the cell count and current before you press Start.
 
-This is an independent hobby project. It is **not affiliated with, endorsed by, or supported by ISDT**. It uses a reverse-engineered protocol and is provided as-is, with no warranty. Use it at your own risk.
+**Use this project entirely at your own risk.**
+
+- It is an independent hobby project and is **not affiliated with, endorsed by, or supported by ISDT**.
+- It talks to the FD-200 using a **reverse-engineered protocol**. Commands or readings may be wrong, and future firmware may behave differently.
+- It is provided **as-is, with no warranty of any kind**. The authors and contributors are **not responsible** for damaged batteries, damaged equipment, fire, injury or any other loss resulting from its use.
+- The safety checks in the code (such as the low-cutoff limit) are a convenience, not a guarantee. Always confirm the settings on the FD-200 itself, and stay with the battery while it discharges.
+- Using this may affect your device warranty. ISDT will not support problems caused by third-party software.
 
 ## Contributing
 
@@ -229,4 +266,4 @@ When reporting a problem, please include the Serial Monitor output (115200 baud)
 
 ## License
 
-<!-- Pick a license (e.g. MIT) and add a LICENSE file to the repo. -->
+This project is released under the [MIT License](LICENSE). You're free to use, modify and share it, including commercially, as long as the copyright notice is kept. It comes with no warranty.
