@@ -32,6 +32,11 @@
 #define AP_SSID "FD200-Discharger"
 #define AP_PASS "12345678"   // 8+ characters. Change this before sharing.
 #define HOSTNAME "fd200"     // on home WiFi the UI is also at http://fd200.local
+
+// Cutoff voltage safety limits (per cell, millivolts). Enforced on the ESP32, not just the page.
+#define CUTOFF_MIN_MV   3000 // below this a start/preset is refused outright
+#define CUTOFF_WARN_MV  3400 // below this the user must confirm (LiPo storage is ~3.80-3.85 V)
+#define CUTOFF_MAX_MV   4200
 // =========================================================
 //
 // WiFi behaviour:
@@ -99,17 +104,27 @@ volatile bool bleConnected = false;
 volatile bool     seen[256];
 volatile uint8_t  respStatus[256];
 volatile uint16_t packMv = 0;
-volatile uint16_t cellMv[8] = {0};
 volatile uint8_t  runState = 0xFF;
 volatile uint32_t elapsedMs = 0;
 volatile uint8_t  setCells = 0;
 volatile uint16_t setCutoffMv = 0;
 volatile uint16_t setCurrentMa = 0;
+volatile uint16_t actualMa = 0;       // E5 [14..15]  current actually flowing (ramps up over ~30 s)
+volatile uint32_t capMah = 0;         // E7 [8..11]   discharged this run, mAh
+volatile uint32_t energyMwh = 0;      // E7 [12..15]  discharged this run, mWh
+volatile uint16_t cycles = 0;         // E7 [29..30]  number of completed discharges (lifetime)
+volatile uint32_t lifeMwh = 0;        // E7 [35..38]  lifetime energy discharged, mWh
+volatile int16_t  tempC = -1;         // E9 [6]       discharger temperature, deg C
 volatile int8_t   autoMode = -1;      // device's auto-discharge setting: -1 unknown, 0 off, 1 on
 
 // Reassembly buffer: long replies (E5, E7) can arrive split across several notifications
 uint8_t rxBuf[96];
 size_t  rxLen = 0, rxNeed = 0;
+
+// Link diagnostics shown on the web page
+volatile uint32_t rxOk = 0, rxBad = 0, rxCut = 0;
+volatile uint8_t  lastCutCmd = 0, lastCutLen = 0, lastCutNeed = 0;
+volatile uint16_t linkMtu = 0;
 
 // ---------- Jobs handed from web handlers to the BLE task ----------
 portMUX_TYPE jobMux = portMUX_INITIALIZER_UNLOCKED;
@@ -178,47 +193,76 @@ bool sendAndWait(const uint8_t* f, size_t n, uint8_t expect, uint32_t timeoutMs,
 // ==================================================================
 // Notifications
 // ==================================================================
-void handleFrame(const uint8_t* d, size_t n) {
+// complete = whole frame received (checksum is verified).
+// complete = false: the FD-200 cut the reply short (seen with small BLE packet sizes);
+// only the live-data fields that fall inside the bytes we did get are used.
+void handleFrame(const uint8_t* d, size_t n, bool complete) {
   if (n < 6) return;
-  uint8_t sum = 0;
-  for (size_t i = 2; i < n - 1; i++) sum += d[i];
-  if (sum != d[n - 1]) { Serial.println("   (bad checksum, ignored)"); return; }
   uint8_t cmd = d[4];
-  respStatus[cmd] = (n >= 6) ? d[5] : 0;
-  seen[cmd] = true;
+  if (complete) {
+    uint8_t sum = 0;
+    for (size_t i = 2; i < n - 1; i++) sum += d[i];
+    if (sum != d[n - 1]) { rxBad++; Serial.println("   (bad checksum, ignored)"); return; }
+    rxOk++;
+    respStatus[cmd] = d[5];
+    seen[cmd] = true;
+  } else {
+    rxCut++;
+    lastCutCmd = cmd; lastCutLen = n; lastCutNeed = d[3] + 5;
+    Serial.printf("   (reply 0x%02X cut short: got %u of %u bytes, using what arrived)\n", cmd, (unsigned)n, (unsigned)(d[3] + 5));
+    if (cmd != 0xE5 && cmd != 0xE7) return;
+  }
 
-  if (cmd == 0xE5 && n >= 34) {
-    packMv = d[12] | (d[13] << 8);
-    for (int i = 0; i < 8; i++) cellMv[i] = d[18 + 2 * i] | (d[19 + 2 * i] << 8);
+  #define HAVE(last) ((size_t)(last) < n)
+  if (cmd == 0xE5) {
+    if (HAVE(13)) packMv   = d[12] | (d[13] << 8);   // the FD-200 only sees the pack (XT60), no per-cell taps
+    if (HAVE(15)) actualMa = d[14] | (d[15] << 8);
   }
-  if (cmd == 0xE7 && n >= 27) {
-    runState     = d[6];
-    elapsedMs    = d[16] | (d[17] << 8) | ((uint32_t)d[18] << 16) | ((uint32_t)d[19] << 24);
-    setCells     = d[21];
-    setCutoffMv  = d[23] | (d[24] << 8);
-    setCurrentMa = d[25] | (d[26] << 8);
+  if (cmd == 0xE7) {
+    if (HAVE(6))  runState  = d[6];
+    if (HAVE(11)) capMah    = d[8]  | (d[9]  << 8) | ((uint32_t)d[10] << 16) | ((uint32_t)d[11] << 24);
+    if (HAVE(15)) energyMwh = d[12] | (d[13] << 8) | ((uint32_t)d[14] << 16) | ((uint32_t)d[15] << 24);
+    if (HAVE(19)) elapsedMs = d[16] | (d[17] << 8) | ((uint32_t)d[18] << 16) | ((uint32_t)d[19] << 24);
+    if (HAVE(21)) setCells  = d[21];
+    if (HAVE(24)) setCutoffMv  = d[23] | (d[24] << 8);
+    if (HAVE(26)) setCurrentMa = d[25] | (d[26] << 8);
+    if (HAVE(30)) cycles  = d[29] | (d[30] << 8);
+    if (HAVE(38)) lifeMwh = d[35] | (d[36] << 8) | ((uint32_t)d[37] << 16) | ((uint32_t)d[38] << 24);
   }
-  if (cmd == 0xD5 && n >= 6) {
+  if (cmd == 0xE9 && complete && n >= 8) {
+    tempC = d[6];
+  }
+  #undef HAVE
+  if (cmd == 0xD5 && complete) {
     autoMode = d[5] ? 1 : 0;           // FF when on, 00 when off (seen in capture)
   }
 }
 
 static void notifyCallback(BLERemoteCharacteristic*, uint8_t* d, size_t n, bool) {
   printHex("<< ", d, n);
-  if (n >= 4 && d[1] == 0xAA && d[2] == 0x21) {
-    // Start of a new frame. Total size = [len][AA][dir][plen] + plen bytes (cmd + data) + chk
-    rxNeed = d[3] + 5;
-    rxLen = 0;
+  if (n < 2) return;
+  // Every notification is [count][count bytes]. Long replies are split into several
+  // notifications, each with its own count byte; the frame is the joined payloads.
+  size_t cl = std::min((size_t)d[0], n - 1);
+  const uint8_t* p = d + 1;
+
+  if (cl >= 3 && p[0] == 0xAA && p[1] == 0x21) {
+    // A new frame starts. If the previous one never finished, use what we got of it.
+    if (rxNeed && rxLen >= 6) handleFrame(rxBuf, rxLen, false);
+    // Rebuild it as [len][AA][21][plen][cmd][data...][chk], len = plen + 4
+    rxNeed = p[2] + 5;
     if (rxNeed > sizeof(rxBuf)) { rxNeed = 0; return; }
+    rxBuf[0] = p[2] + 4;
+    rxLen = 1;
   } else if (rxNeed == 0) {
-    return;                            // stray continuation or foreign data
+    return;                            // stray piece or foreign data
   }
-  size_t take = std::min(n, rxNeed - rxLen);
-  memcpy(rxBuf + rxLen, d, take);
+  size_t take = std::min(cl, rxNeed - rxLen);
+  memcpy(rxBuf + rxLen, p, take);
   rxLen += take;
   if (rxLen < rxNeed) return;          // wait for the rest
   rxNeed = 0;
-  handleFrame(rxBuf, rxLen);
+  handleFrame(rxBuf, rxLen, true);
 }
 
 class FDClientCB : public BLEClientCallbacks {
@@ -227,6 +271,7 @@ class FDClientCB : public BLEClientCallbacks {
     bleConnected = false;
     runState = 0xFF;
     autoMode = -1;
+    tempC = -1;
     rxNeed = 0;
     Serial.println("BLE disconnected");
   }
@@ -281,6 +326,13 @@ bool connectFD200(const String& addr, uint8_t type) {
   }
   pChar->registerForNotify(notifyCallback);
   delay(200);
+
+  // Ask for bigger packets now that the link is up (the request made while connecting
+  // isn't always honoured). Long replies are 43 bytes; the default MTU only fits 20.
+  pClient->setMTU(247);
+  delay(300);
+  linkMtu = pClient->getMTU();
+  rxNeed = 0; rxOk = rxBad = rxCut = 0;
   bleConnected = true;
 
   if (!sendAndWait(AUTH_FRAME, sizeof(AUTH_FRAME), 0x19, 1500, 3)) {
@@ -302,7 +354,7 @@ bool connectFD200(const String& addr, uint8_t type) {
   n = buildFrame(0xD4, nullptr, 0, f);   // read the auto-discharge setting
   sendAndWait(f, n, 0xD5, 1500, 2);
 
-  Serial.println(">>> Connected and authenticated <<<");
+  Serial.printf(">>> Connected and authenticated (MTU %u) <<<\n", (unsigned)linkMtu);
   return true;
 }
 
@@ -665,7 +717,20 @@ let devices=[];
 const $=id=>document.getElementById(id);
 function say(t){$('msg').textContent=t;}
 function act(u){say('Sending...');fetch(u).then(r=>r.json()).then(d=>say(d.msg)).catch(()=>say('Network error'));}
-function start(){act('/start?cells='+$('cells').value+'&volt='+$('volt').value+'&amps='+$('amps').value);}
+// Cutoff limits come from the ESP32 (/status) so the #defines are the single source of truth
+function lim(){const s=lastStatus||{};return {min:s.cutMinMv||3000,warn:s.cutWarnMv||3400,max:s.cutMaxMv||4200};}
+// Returns true if the cutoff is OK to use (asking the user when it's low), false otherwise
+function checkCutoff(action){
+  const L=lim(),v=parseFloat($('volt').value),mv=Math.round(v*1000),c=$('cells').value;
+  if(isNaN(v)||mv<L.min||mv>L.max){say('Cutoff must be between '+(L.min/1000).toFixed(2)+' and '+(L.max/1000).toFixed(2)+' V per cell');return false;}
+  if(mv<L.warn)return confirm('LOW CUTOFF WARNING\n\n'+v.toFixed(2)+' V/cell ('+(v*c).toFixed(2)+' V for '+c+'S) is below '+(L.warn/1000).toFixed(2)+' V/cell.\n\nDischarging this low can permanently damage LiPo / Li-ion packs. Storage voltage is usually 3.80-3.85 V/cell for LiPo.\n\n'+action+' anyway?');
+  return true;
+}
+function start(){
+  if(!checkCutoff('Start'))return;
+  const low=Math.round(parseFloat($('volt').value)*1000)<lim().warn;
+  act('/start?cells='+$('cells').value+'&volt='+$('volt').value+'&amps='+$('amps').value+(low?'&confirm=1':''));
+}
 
 // ----- presets -----
 let presets=[];
@@ -699,6 +764,7 @@ function fieldChanged(){
   updLabel();
 }
 function savePreset(){
+  if(!checkCutoff('Save this preset'))return;
   const cur=selP();
   let n=prompt('Name this preset (e.g. the drone or pack name).\nSaves '+$('cells').value+'S, '+($('amps').value/1000)+' A, '+$('volt').value+' V/cell.',cur?cur.name:'');
   if(n===null)return;n=n.trim();if(!n)return;
@@ -738,6 +804,8 @@ function pick(x){
   .then(r=>r.json()).then(d=>{say(d.msg);$('list').innerHTML='';});
 }
 function forget(){fetch('/forget').then(r=>r.json()).then(d=>say(d.msg));}
+function fmtTime(ms){const t=Math.floor(ms/1000),h=Math.floor(t/3600),m=Math.floor(t/60)%60,s=t%60;
+  return (h?h+':'+String(m).padStart(2,'0'):m)+':'+String(s).padStart(2,'0');}
 let lastStatus=null,autoBusy=false;
 function setAuto(){
   const c=$('autoChk'),on=c.checked,s=lastStatus;
@@ -747,7 +815,7 @@ function setAuto(){
   }
   autoBusy=true;c.disabled=true;say('Sending...');
   fetch('/auto?on='+(on?1:0)).then(r=>r.json()).then(d=>{
-    say(d.msg+(!on&&s&&s.state=='discharging'?'. Note: a discharge already running keeps going, tap Stop to end it.':''));
+    say(d.msg+(!on&&s&&s.state.startsWith('discharging')?'. Note: a discharge already running keeps going, tap Stop to end it.':''));
   }).catch(()=>say('Network error')).finally(()=>{autoBusy=false;poll();});
 }
 function poll(){fetch('/status').then(r=>r.json()).then(s=>{
@@ -761,11 +829,17 @@ function poll(){fetch('/status').then(r=>r.json()).then(s=>{
   lastStatus=s;
   if(!autoBusy){$('autoChk').checked=s.auto==1;$('autoChk').disabled=!s.connected||s.auto<0;}
   if(!s.connected){$('live').textContent='Not connected';return;}
+  const run=s.state.startsWith('discharging');
   $('live').textContent='State: '+s.state+
    '\nPack: '+(s.packMv/1000).toFixed(2)+' V'+
-   '\nCells: '+s.cells.filter(c=>c>0).map(c=>(c/1000).toFixed(3)).join(' / ')+
+   (run?'\nCurrent: '+(s.actualMa/1000).toFixed(2)+' A   Power: '+Math.round(s.packMv*s.actualMa/1e6)+' W':'')+
+   '\nRun time: '+fmtTime(s.elapsedMs)+
+   '\nDischarged: '+s.capMah+' mAh / '+(s.energyMwh/1000).toFixed(2)+' Wh'+
+   (s.tempC>=0?'\nTemperature: '+s.tempC+' \u00B0C':'')+
    '\nDevice setting: '+s.setCells+'S to '+(s.setCutoffMv/1000).toFixed(2)+' V/cell at '+(s.setCurrentMa/1000).toFixed(1)+' A'+
-   '\nRun time: '+Math.round(s.elapsedMs/1000)+' s';
+   (s.cycles?'\nLifetime: '+s.cycles+' discharges, '+(s.lifeMwh/1000).toFixed(1)+' Wh':'');
+  const dg=document.createElement('div');dg.style.cssText='font-size:11px;color:#718096;margin-top:6px';
+  dg.textContent='Link: '+s.diag;$('live').appendChild(dg);
 }).catch(()=>{});}
 let wFilled=false,wLast=null,nets=[];
 function wsay(t){$('wmsg').style.display='block';$('wmsg').textContent=t;}
@@ -866,7 +940,8 @@ void savePresets() {
 
 bool validSettings(int cells, float volt, long amps) {
   bool ampsOk = (amps == 5000 || amps == 10000 || amps == 15000 || amps == 20000 || amps == 25000);
-  return cells >= 1 && cells <= 8 && volt >= 2.8f && volt <= 4.2f && ampsOk;
+  long mv = lroundf(volt * 1000.0f);
+  return cells >= 1 && cells <= 8 && mv >= CUTOFF_MIN_MV && mv <= CUTOFF_MAX_MV && ampsOk;
 }
 
 String cleanName(String n) {
@@ -930,13 +1005,22 @@ void handleStart() {
   int cells = server.arg("cells").toInt();
   float volt = server.arg("volt").toFloat();
   long amps = server.arg("amps").toInt();
-  bool ampsOk = (amps == 5000 || amps == 10000 || amps == 15000 || amps == 20000 || amps == 25000);
-  if (cells < 1 || cells > 8 || volt < 2.8f || volt > 4.2f || !ampsOk) {
+  long mv = lroundf(volt * 1000.0f);
+  if (mv < CUTOFF_MIN_MV || mv > CUTOFF_MAX_MV) {
+    sendResult(false, "Cutoff must be between " + String(CUTOFF_MIN_MV / 1000.0, 2) + " and " +
+                      String(CUTOFF_MAX_MV / 1000.0, 2) + " V per cell");
+    return;
+  }
+  if (mv < CUTOFF_WARN_MV && server.arg("confirm") != "1") {
+    sendResult(false, "Cutoff below " + String(CUTOFF_WARN_MV / 1000.0, 2) + " V/cell needs confirmation");
+    return;
+  }
+  if (!validSettings(cells, volt, amps)) {
     sendResult(false, "Invalid parameters");
     return;
   }
   jobCells = cells;
-  jobCutoffMv = (uint16_t)lroundf(volt * 1000.0f);
+  jobCutoffMv = (uint16_t)mv;
   jobCurrentMa = (uint16_t)amps;
   String msg;
   bool ok = submitJob(JOB_START, 5000, msg);
@@ -1003,6 +1087,16 @@ void handleForget() {
   sendResult(true, "Discharger forgotten");
 }
 
+String linkDiag() {
+  String s = "MTU " + String((unsigned)linkMtu) + ", replies ok " + String((unsigned long)rxOk) +
+             " / bad " + String((unsigned long)rxBad) + " / cut short " + String((unsigned long)rxCut);
+  if (rxCut) {
+    s += " (last 0x" + String((unsigned)lastCutCmd, HEX) + ": " + String((unsigned)lastCutLen) +
+         " of " + String((unsigned)lastCutNeed) + " bytes)";
+  }
+  return s;
+}
+
 void handleStatus() {
   xSemaphoreTake(cfgMutex, portMAX_DELAY);
   String a = cfgAddr, n = cfgName, e = lastError;
@@ -1010,17 +1104,23 @@ void handleStatus() {
 
   String st;
   if (runState == 0x00) st = "idle";
-  else if (runState == 0x02) st = "discharging";
+  else if (runState == 0x02) st = "discharging (ramping up)";
+  else if (runState == 0x03) st = "discharging";
   else if (runState == 0xFF) st = "unknown";
   else st = "code 0x" + String(runState, HEX);
 
   String j = "{\"connected\":" + String(bleConnected ? "true" : "false") +
              ",\"addr\":\"" + a + "\",\"name\":\"" + jsonEsc(n) + "\",\"error\":\"" + jsonEsc(e) +
-             "\",\"state\":\"" + st + "\",\"packMv\":" + String(packMv) + ",\"cells\":[";
-  for (int i = 0; i < 8; i++) { j += String(cellMv[i]); if (i < 7) j += ","; }
-  j += "],\"setCells\":" + String(setCells) + ",\"setCutoffMv\":" + String(setCutoffMv) +
+             "\",\"state\":\"" + st + "\",\"packMv\":" + String(packMv);
+  j += ",\"setCells\":" + String(setCells) + ",\"setCutoffMv\":" + String(setCutoffMv) +
        ",\"setCurrentMa\":" + String(setCurrentMa) + ",\"elapsedMs\":" + String(elapsedMs) +
-       ",\"auto\":" + String((int)autoMode);
+       ",\"actualMa\":" + String(actualMa) + ",\"capMah\":" + String(capMah) +
+       ",\"energyMwh\":" + String(energyMwh) + ",\"cycles\":" + String(cycles) +
+       ",\"lifeMwh\":" + String(lifeMwh) + ",\"tempC\":" + String(tempC) +
+       ",\"diag\":\"" + linkDiag() + "\"" +
+       ",\"auto\":" + String((int)autoMode) +
+       ",\"cutMinMv\":" + String(CUTOFF_MIN_MV) + ",\"cutWarnMv\":" + String(CUTOFF_WARN_MV) +
+       ",\"cutMaxMv\":" + String(CUTOFF_MAX_MV);
 
   static const char* modeNames[] = {"off", "connecting", "connected", "lost", "waiting"};
   bool up = (wState == W_CONNECTED);
